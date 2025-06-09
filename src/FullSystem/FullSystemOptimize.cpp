@@ -407,198 +407,212 @@ void FullSystem::printOptRes(const Vec3 &res, double resL, double resM, double r
 
 float FullSystem::optimize(int mnumOptIts)
 {
+    // 如果帧数少于2帧，无法进行优化，直接返回0
+    if(frameHessians.size() < 2) return 0;
+    
+    // 根据帧数动态调整优化迭代次数
+    // 帧数越少，需要更多迭代次数来保证收敛
+    if(frameHessians.size() < 3) mnumOptIts = 20;  // 3帧以下用20次迭代
+    if(frameHessians.size() < 4) mnumOptIts = 15;  // 4帧以下用15次迭代
 
-	if(frameHessians.size() < 2) return 0;
-	if(frameHessians.size() < 3) mnumOptIts = 20;
-	if(frameHessians.size() < 4) mnumOptIts = 15;
+    // ============= 第一步：收集统计信息和活跃残差 =============
+    
+    activeResiduals.clear();  // 清空活跃残差列表
+    int numPoints = 0;        // 统计点的总数
+    int numLRes = 0;          // 统计已线性化残差的数量
+    
+    // 遍历所有帧中的所有点
+    for(FrameHessian* fh : frameHessians)
+        for(PointHessian* ph : fh->pointHessians)
+        {
+            // 遍历每个点的所有残差
+            for(PointFrameResidual* r : ph->residuals)
+            {
+                // 如果残差还未被线性化，则加入活跃残差列表
+                if(!r->efResidual->isLinearized)
+                {
+                    activeResiduals.push_back(r);
+                    r->resetOOB();  // 重置越界标志
+                }
+                else
+                    numLRes++;  // 统计已线性化的残差数量
+            }
+            numPoints++;  // 统计点数
+        }
 
-
-
-
-
-
-	// get statistics and active residuals.
-
-	activeResiduals.clear();
-	int numPoints = 0;
-	int numLRes = 0;
-	for(FrameHessian* fh : frameHessians)
-		for(PointHessian* ph : fh->pointHessians)
-		{
-			for(PointFrameResidual* r : ph->residuals)
-			{
-				if(!r->efResidual->isLinearized)
-				{
-					activeResiduals.push_back(r);
-					r->resetOOB();
-				}
-				else
-					numLRes++;
-			}
-			numPoints++;
-		}
-
+    // 打印优化统计信息：点数、活跃残差数、线性化残差数
     if(!setting_debugout_runquiet)
         printf("OPTIMIZE %d pts, %d active res, %d lin res!\n",ef->nPoints,(int)activeResiduals.size(), numLRes);
 
+    // ============= 第二步：计算初始能量 =============
+    
+    // 线性化所有残差，计算雅可比矩阵和残差值
+    Vec3 lastEnergy = linearizeAll(false);  // false表示不固定线性化点
+    double lastEnergyL = calcLEnergy();     // 计算线性化能量项
+    double lastEnergyM = calcMEnergy();     // 计算边缘化能量项
 
-	Vec3 lastEnergy = linearizeAll(false);
-	double lastEnergyL = calcLEnergy();
-	double lastEnergyM = calcMEnergy();
+    // ============= 第三步：应用残差 =============
+    
+    // 根据是否启用多线程来应用残差
+    if(multiThreading)
+        treadReduce.reduce(boost::bind(&FullSystem::applyRes_Reductor, this, true, _1, _2, _3, _4), 0, activeResiduals.size(), 50);
+    else
+        applyRes_Reductor(true,0,activeResiduals.size(),0,0);
 
-
-
-
-
-	if(multiThreading)
-		treadReduce.reduce(boost::bind(&FullSystem::applyRes_Reductor, this, true, _1, _2, _3, _4), 0, activeResiduals.size(), 50);
-	else
-		applyRes_Reductor(true,0,activeResiduals.size(),0,0);
-
-
+    // 打印初始误差信息
     if(!setting_debugout_runquiet)
     {
         printf("Initial Error       \t");
         printOptRes(lastEnergy, lastEnergyL, lastEnergyM, 0, 0, frameHessians.back()->aff_g2l().a, frameHessians.back()->aff_g2l().b);
     }
 
-	debugPlotTracking();
+    debugPlotTracking();  // 调试绘图
 
+    // ============= 第四步：主优化循环（Levenberg-Marquardt算法）=============
+    
+    double lambda = 1e-1;    // LM算法的阻尼因子，初始值0.1
+    float stepsize = 1;      // 步长大小
+    // 存储上一次的优化变量，用于计算方向变化
+    VecX previousX = VecX::Constant(CPARS+ 8*frameHessians.size(), NAN);
+    
+    // 开始迭代优化
+    for(int iteration=0; iteration < mnumOptIts; iteration++)
+    {
+        // ========== 求解线性系统 ==========
+        backupState(iteration!=0);           // 备份当前状态（第一次迭代不备份步长）
+        solveSystem(iteration, lambda);      // 求解正规方程组 (H + λI)Δx = -b
+        
+        // 计算优化方向的变化量（用于自适应步长）
+        double incDirChange = (1e-20 + previousX.dot(ef->lastX)) / (1e-20 + previousX.norm() * ef->lastX.norm());
+        previousX = ef->lastX;  // 保存当前的优化变量
 
+        // ========== 自适应步长调整 ==========
+        if(std::isfinite(incDirChange) && (setting_solverMode & SOLVER_STEPMOMENTUM))
+        {
+            // 根据方向变化调整步长
+            float newStepsize = exp(incDirChange*1.4);
+            if(incDirChange<0 && stepsize>1) stepsize=1;  // 方向变化为负且步长>1时，重置为1
 
-	double lambda = 1e-1;
-	float stepsize=1;
-	VecX previousX = VecX::Constant(CPARS+ 8*frameHessians.size(), NAN);
-	for(int iteration=0;iteration<mnumOptIts;iteration++)
-	{
-		// solve!
-		backupState(iteration!=0);
-		//solveSystemNew(0);
-		solveSystem(iteration, lambda);
-		double incDirChange = (1e-20 + previousX.dot(ef->lastX)) / (1e-20 + previousX.norm() * ef->lastX.norm());
-		previousX = ef->lastX;
+            // 使用四次根来平滑步长变化
+            stepsize = sqrtf(sqrtf(newStepsize*stepsize*stepsize*stepsize));
+            if(stepsize > 2) stepsize=2;        // 限制最大步长
+            if(stepsize <0.25) stepsize=0.25;   // 限制最小步长
+        }
 
+        // ========== 执行优化步长 ==========
+        // 应用计算出的步长更新到所有优化变量（相机内参、位姿、仿射参数、深度）
+        bool canbreak = doStepFromBackup(stepsize,stepsize,stepsize,stepsize,stepsize);
 
-		if(std::isfinite(incDirChange) && (setting_solverMode & SOLVER_STEPMOMENTUM))
-		{
-			float newStepsize = exp(incDirChange*1.4);
-			if(incDirChange<0 && stepsize>1) stepsize=1;
+        // ========== 计算新的能量 ==========
+        Vec3 newEnergy = linearizeAll(false);  // 重新线性化计算新能量
+        double newEnergyL = calcLEnergy();     // 新的线性化能量
+        double newEnergyM = calcMEnergy();     // 新的边缘化能量
 
-			stepsize = sqrtf(sqrtf(newStepsize*stepsize*stepsize*stepsize));
-			if(stepsize > 2) stepsize=2;
-			if(stepsize <0.25) stepsize=0.25;
-		}
-
-		bool canbreak = doStepFromBackup(stepsize,stepsize,stepsize,stepsize,stepsize);
-
-
-
-
-
-
-
-		// eval new energy!
-		Vec3 newEnergy = linearizeAll(false);
-		double newEnergyL = calcLEnergy();
-		double newEnergyM = calcMEnergy();
-
-
-
-
+        // 打印当前迭代的优化信息
         if(!setting_debugout_runquiet)
         {
             printf("%s %d (L %.2f, dir %.2f, ss %.1f): \t",
-				(newEnergy[0] +  newEnergy[1] +  newEnergyL + newEnergyM <
-						lastEnergy[0] + lastEnergy[1] + lastEnergyL + lastEnergyM) ? "ACCEPT" : "REJECT",
-				iteration,
-				log10(lambda),
-				incDirChange,
-				stepsize);
+                // 判断是接受还是拒绝这一步（基于能量是否减少）
+                (newEnergy[0] +  newEnergy[1] +  newEnergyL + newEnergyM <
+                        lastEnergy[0] + lastEnergy[1] + lastEnergyL + lastEnergyM) ? "ACCEPT" : "REJECT",
+                iteration,
+                log10(lambda),      // 阻尼因子的对数
+                incDirChange,       // 方向变化
+                stepsize);          // 当前步长
             printOptRes(newEnergy, newEnergyL, newEnergyM , 0, 0, frameHessians.back()->aff_g2l().a, frameHessians.back()->aff_g2l().b);
         }
 
-		if(setting_forceAceptStep || (newEnergy[0] +  newEnergy[1] +  newEnergyL + newEnergyM <
-				lastEnergy[0] + lastEnergy[1] + lastEnergyL + lastEnergyM))
-		{
+        // ========== LM算法：接受或拒绝步长 ==========
+        if(setting_forceAceptStep || (newEnergy[0] +  newEnergy[1] +  newEnergyL + newEnergyM <
+                lastEnergy[0] + lastEnergy[1] + lastEnergyL + lastEnergyM))
+        {
+            // 能量减少，接受这一步
+            
+            // 应用残差更新
+            if(multiThreading)
+                treadReduce.reduce(boost::bind(&FullSystem::applyRes_Reductor, this, true, _1, _2, _3, _4), 0, activeResiduals.size(), 50);
+            else
+                applyRes_Reductor(true,0,activeResiduals.size(),0,0);
 
-			if(multiThreading)
-				treadReduce.reduce(boost::bind(&FullSystem::applyRes_Reductor, this, true, _1, _2, _3, _4), 0, activeResiduals.size(), 50);
-			else
-				applyRes_Reductor(true,0,activeResiduals.size(),0,0);
+            // 更新最优能量值
+            lastEnergy = newEnergy;
+            lastEnergyL = newEnergyL;
+            lastEnergyM = newEnergyM;
 
-			lastEnergy = newEnergy;
-			lastEnergyL = newEnergyL;
-			lastEnergyM = newEnergyM;
+            lambda *= 0.25;  // 减小阻尼因子（更接近高斯-牛顿法）
+        }
+        else
+        {
+            // 能量增加，拒绝这一步
+            loadSateBackup();           // 恢复到备份状态
+            lastEnergy = linearizeAll(false);  // 重新计算能量
+            lastEnergyL = calcLEnergy();
+            lastEnergyM = calcMEnergy();
+            lambda *= 1e2;             // 增大阻尼因子（更接近梯度下降）
+        }
 
-			lambda *= 0.25;
-		}
-		else
-		{
-			loadSateBackup();
-			lastEnergy = linearizeAll(false);
-			lastEnergyL = calcLEnergy();
-			lastEnergyM = calcMEnergy();
-			lambda *= 1e2;
-		}
-
-
-		if(canbreak && iteration >= setting_minOptIterations) break;
-	}
-
-
-
-	Vec10 newStateZero = Vec10::Zero();
-	newStateZero.segment<2>(6) = frameHessians.back()->get_state().segment<2>(6);
-
-	frameHessians.back()->setEvalPT(frameHessians.back()->PRE_worldToCam,
-			newStateZero);
-	EFDeltaValid=false;
-	EFAdjointsValid=false;
-	ef->setAdjointsF(&Hcalib);
-	setPrecalcValues();
-
-
-
-
-	lastEnergy = linearizeAll(true);
-
-
-
-
-	if(!std::isfinite((double)lastEnergy[0]) || !std::isfinite((double)lastEnergy[1]) || !std::isfinite((double)lastEnergy[2]))
-    {
-        printf("KF Tracking failed: LOST!\n");
-		isLost=true;
+        // 检查收敛条件：如果步长足够小且达到最小迭代次数，则跳出循环
+        if(canbreak && iteration >= setting_minOptIterations) break;
     }
 
+    // ============= 第五步：优化后处理 =============
+    
+    // 设置最后一帧的状态，保持仿射参数不变
+    Vec10 newStateZero = Vec10::Zero();
+    newStateZero.segment<2>(6) = frameHessians.back()->get_state().segment<2>(6);  // 保持仿射参数
 
-	statistics_lastFineTrackRMSE = sqrtf((float)(lastEnergy[0] / (patternNum*ef->resInA)));
+    // 更新最后一帧的评估点
+    frameHessians.back()->setEvalPT(frameHessians.back()->PRE_worldToCam, newStateZero);
+    
+    // 重置能量函数相关标志
+    EFDeltaValid=false;     // 增量无效，需要重新计算
+    EFAdjointsValid=false;  // 伴随矩阵无效，需要重新计算
+    
+    // 设置伴随矩阵和预计算值
+    ef->setAdjointsF(&Hcalib);
+    setPrecalcValues();
 
-	if(calibLog != 0)
-	{
-		(*calibLog) << Hcalib.value_scaled.transpose() <<
-				" " << frameHessians.back()->get_state_scaled().transpose() <<
-				" " << sqrtf((float)(lastEnergy[0] / (patternNum*ef->resInA))) <<
-				" " << ef->resInM << "\n";
-		calibLog->flush();
-	}
+    // 最终线性化，固定线性化点
+    lastEnergy = linearizeAll(true);  // true表示固定线性化点
 
-	{
-		boost::unique_lock<boost::mutex> crlock(shellPoseMutex);
-		for(FrameHessian* fh : frameHessians)
-		{
-			fh->shell->camToWorld = fh->PRE_camToWorld;
-			fh->shell->aff_g2l = fh->aff_g2l();
-		}
-	}
+    // ============= 第六步：检查优化结果 =============
+    
+    // 检查能量值是否有限，如果无限大则表示跟踪失败
+    if(!std::isfinite((double)lastEnergy[0]) || !std::isfinite((double)lastEnergy[1]) || !std::isfinite((double)lastEnergy[2]))
+    {
+        printf("KF Tracking failed: LOST!\n");
+        isLost=true;  // 设置丢失标志
+    }
 
+    // 计算最终的RMSE（均方根误差）
+    statistics_lastFineTrackRMSE = sqrtf((float)(lastEnergy[0] / (patternNum*ef->resInA)));
 
+    // ============= 第七步：记录和更新 =============
+    
+    // 如果启用了标定日志，记录优化结果
+    if(calibLog != 0)
+    {
+        (*calibLog) << Hcalib.value_scaled.transpose() <<           // 相机内参
+                " " << frameHessians.back()->get_state_scaled().transpose() <<  // 最后一帧状态
+                " " << sqrtf((float)(lastEnergy[0] / (patternNum*ef->resInA))) << // RMSE
+                " " << ef->resInM << "\n";  // 边缘化残差数
+        calibLog->flush();
+    }
 
+    // 更新所有帧的位姿到shell中（用于外部访问）
+    {
+        boost::unique_lock<boost::mutex> crlock(shellPoseMutex);
+        for(FrameHessian* fh : frameHessians)
+        {
+            fh->shell->camToWorld = fh->PRE_camToWorld;  // 相机到世界坐标变换
+            fh->shell->aff_g2l = fh->aff_g2l();          // 仿射光度变换参数
+        }
+    }
 
-	debugPlotTracking();
+    debugPlotTracking();  // 调试绘图
 
-	return sqrtf((float)(lastEnergy[0] / (patternNum*ef->resInA)));
-
+    // 返回最终的RMSE作为优化质量指标
+    return sqrtf((float)(lastEnergy[0] / (patternNum*ef->resInA)));
 }
 
 
